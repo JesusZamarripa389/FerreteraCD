@@ -1,0 +1,89 @@
+# codemagic.yaml - FerreteraCD
+# Compila la app para el simulador de iOS y la sube a Appetize.io
+# para poder ejecutarla desde el navegador.
+#
+# Antes de usarlo:
+#   1. En Codemagic > App settings > Environment variables, crea un grupo
+#      llamado "appetize" con la variable APPETIZE_API_TOKEN (marcada como Secret).
+#      El token se obtiene en https://appetize.io > Account > API token.
+#   2. (Opcional) Despues de la primera subida, agrega APPETIZE_PUBLIC_KEY
+#      al mismo grupo para que las siguientes compilaciones actualicen
+#      la misma app en lugar de crear una nueva.
+
+workflows:
+  ferreteracd-appetize:
+    name: FerreteraCD - Simulador en Appetize
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      groups:
+        - appetize
+      vars:
+        XCODE_PROJECT: "FerreteraCD.xcodeproj"
+        XCODE_TARGET: "FerreteraCD"
+        BUILD_DIR: "build"
+      xcode: latest            # el proyecto usa iOS 26.2 como deployment target
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "main"
+          include: true
+    scripts:
+      - name: Informacion del entorno
+        script: |
+          xcodebuild -version
+          xcodebuild -list -project "$XCODE_PROJECT"
+
+      - name: Compilar para el simulador de iOS
+        script: |
+          xcodebuild build \
+            -project "$XCODE_PROJECT" \
+            -target "$XCODE_TARGET" \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            SYMROOT="$CM_BUILD_DIR/$BUILD_DIR" \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS="arm64 x86_64" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Empaquetar la .app en un zip
+        script: |
+          APP_DIR="$CM_BUILD_DIR/$BUILD_DIR/Debug-iphonesimulator"
+          ls -la "$APP_DIR"
+          cd "$APP_DIR"
+          ditto -c -k --sequesterRsrc --keepParent FerreteraCD.app "$CM_BUILD_DIR/FerreteraCD-simulator.zip"
+          echo "APP_ZIP=$CM_BUILD_DIR/FerreteraCD-simulator.zip" >> $CM_ENV
+
+      - name: Subir a Appetize.io
+        script: |
+          if [ -z "$APPETIZE_API_TOKEN" ]; then
+            echo "Falta APPETIZE_API_TOKEN en el grupo 'appetize'"; exit 1
+          fi
+
+          if [ -n "$APPETIZE_PUBLIC_KEY" ]; then
+            URL="https://api.appetize.io/v1/apps/$APPETIZE_PUBLIC_KEY"   # actualizar app existente
+          else
+            URL="https://api.appetize.io/v1/apps"                        # crear app nueva
+          fi
+
+          RESPONSE=$(curl --fail-with-body -sS -X POST "$URL" \
+            -H "X-API-KEY: $APPETIZE_API_TOKEN" \
+            -F "file=@$APP_ZIP" \
+            -F "platform=ios" \
+            -F "note=FerreteraCD build $BUILD_NUMBER ($CM_COMMIT)")
+
+          echo "$RESPONSE" > "$CM_BUILD_DIR/appetize_response.json"
+          PUBLIC_KEY=$(echo "$RESPONSE" | python3 -c 'import sys,json; print(json.load(sys.stdin)["publicKey"])')
+          echo "======================================================"
+          echo " App lista en Appetize:"
+          echo " https://appetize.io/app/$PUBLIC_KEY"
+          echo " (guarda APPETIZE_PUBLIC_KEY=$PUBLIC_KEY para reutilizarla)"
+          echo "======================================================"
+
+    artifacts:
+      - FerreteraCD-simulator.zip
+      - appetize_response.json
+      - /tmp/xcodebuild_logs/*.log
